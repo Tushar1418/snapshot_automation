@@ -1,4 +1,33 @@
 # cloudbuild.yaml
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      chmod +x snapshot_gcp.sh
+      ./snapshot_gcp.sh \
+        --servers-file servers.txt \
+        --project "${_PROJECT}" \
+        --labels "${_LABELS}" \
+        --retention-days ${_RETENTION} \
+        --activity "${_ACTIVITY}" \
+        --backup-type ${_BACKUP_TYPE} \
+        --storage-location "${_STORAGE_LOCATION}" \
+        ${_DRYRUN_FLAG}
+substitutions:
+  _PROJECT: 'snapshottask'
+  _LABELS: 'env=dev,owner=boss'
+  _RETENTION: '7'
+  _ACTIVITY: 'nightly'
+  _BACKUP_TYPE: 'incremental'
+  _STORAGE_LOCATION: ''
+  _DRYRUN_FLAG: '--dry-run'
+timeout: '1200s'
+
 steps:
 # Step 1: make script executable (safe)
 - name: 'gcr.io/cloud-builders/gcloud'

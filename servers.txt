@@ -1,0 +1,3 @@
+snapshottask,asia-south1-b,dev-server
+snapshottask,asia-south1-b,prod-server
+snapshottask,asia-south1-b,test-server

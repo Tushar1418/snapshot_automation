@@ -1,0 +1,34 @@
+# cloudbuild.yaml
+steps:
+# Step 1: make script executable (safe)
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      chmod +x snapshot_gcp.sh
+
+# Step 2: run snapshot script
+- name: 'gcr.io/cloud-builders/gcloud'
+  entrypoint: 'bash'
+  args:
+    - '-c'
+    - |
+      ./snapshot_gcp.sh \
+        --servers-file servers.txt \
+        --project "${_PROJECT}" \
+        --labels "${_LABELS}" \
+        --retention-days ${_RETENTION} \
+        --activity "${_ACTIVITY}" \
+        --backup-type ${_BACKUP_TYPE} \
+        --storage-location "${_STORAGE_LOCATION}" \
+        ${_DRYRUN_FLAG}
+substitutions:
+  _PROJECT: 'snapshottask'           # override in trigger
+  _LABELS: 'env=dev,owner=boss'
+  _RETENTION: '7'
+  _ACTIVITY: 'nightly'
+  _BACKUP_TYPE: 'incremental'
+  _STORAGE_LOCATION: ''
+  _DRYRUN_FLAG: '--dry-run'         # set '' to run for real; useful for manual triggers
+timeout: '1200s'

@@ -1,23 +1,6 @@
-# cloudbuild.yaml
 options:
   logging: CLOUD_LOGGING_ONLY
 
-steps:
-- name: 'gcr.io/cloud-builders/gcloud'
-  entrypoint: 'bash'
-  args:
-    - '-c'
-    - |
-      chmod +x snapshot_gcp.sh
-      ./snapshot_gcp.sh \
-        --servers-file servers.txt \
-        --project "${_PROJECT}" \
-        --labels "${_LABELS}" \
-        --retention-days ${_RETENTION} \
-        --activity "${_ACTIVITY}" \
-        --backup-type ${_BACKUP_TYPE} \
-        --storage-location "${_STORAGE_LOCATION}" \
-        ${_DRYRUN_FLAG}
 substitutions:
   _PROJECT: 'snapshottask'
   _LABELS: 'env=dev,owner=boss'
@@ -25,39 +8,32 @@ substitutions:
   _ACTIVITY: 'nightly'
   _BACKUP_TYPE: 'incremental'
   _STORAGE_LOCATION: ''
-  _DRYRUN_FLAG: '--dry-run'
-timeout: '1200s'
+  _DRYRUN_FLAG: '--dry-run'   # set to '' in trigger if you want real run
 
 steps:
-# Step 1: make script executable (safe)
-- name: 'gcr.io/cloud-builders/gcloud'
-  entrypoint: 'bash'
-  args:
-    - '-c'
-    - |
-      chmod +x snapshot_gcp.sh
+  - name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        set -e
 
-# Step 2: run snapshot script
-- name: 'gcr.io/cloud-builders/gcloud'
-  entrypoint: 'bash'
-  args:
-    - '-c'
-    - |
-      ./snapshot_gcp.sh \
-        --servers-file servers.txt \
-        --project "${_PROJECT}" \
-        --labels "${_LABELS}" \
-        --retention-days ${_RETENTION} \
-        --activity "${_ACTIVITY}" \
-        --backup-type ${_BACKUP_TYPE} \
-        --storage-location "${_STORAGE_LOCATION}" \
-        ${_DRYRUN_FLAG}
-substitutions:
-  _PROJECT: 'snapshottask'           # override in trigger
-  _LABELS: 'env=dev,owner=boss'
-  _RETENTION: '7'
-  _ACTIVITY: 'nightly'
-  _BACKUP_TYPE: 'incremental'
-  _STORAGE_LOCATION: ''
-  _DRYRUN_FLAG: '--dry-run'         # set '' to run for real; useful for manual triggers
+        echo "==> Installing jq..."
+        apt-get update -y
+        apt-get install -y jq
+
+        echo "==> Making snapshot script executable..."
+        chmod +x snapshot_gcp.sh
+
+        echo "==> Running snapshot script..."
+        ./snapshot_gcp.sh \
+          --servers-file servers.txt \
+          --project "${_PROJECT}" \
+          --labels "${_LABELS}" \
+          --retention-days ${_RETENTION} \
+          --activity "${_ACTIVITY}" \
+          --backup-type ${_BACKUP_TYPE} \
+          --storage-location "${_STORAGE_LOCATION}" \
+          ${_DRYRUN_FLAG}
+
 timeout: '1200s'

@@ -8,7 +8,7 @@ substitutions:
   _ACTIVITY: 'nightly'
   _BACKUP_TYPE: 'incremental'
   _STORAGE_LOCATION: ''
-  _DRYRUN_FLAG: '--dry-run'   # set to '' in trigger if you want real run
+  _DRYRUN_FLAG: '--dry-run'   # set '' in trigger to run for real
 
 steps:
   - name: 'gcr.io/cloud-builders/gcloud'

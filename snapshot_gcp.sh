@@ -3,7 +3,9 @@
 # Flexible GCP snapshotter with:
 #  - servers list support (project/zone/instance; zone/instance; instance)
 #  - optional per-line retention override
-#  - labels: activity, backup-type, storage-type, created-by, retention-days
+#  - supports treating name as VM or as disk directly
+#  - tolerant of extra spaces in servers file
+#  - labels: activity, backup-type, storage-type, created-by, retention-days (+ user labels/tags)
 #  - snapshot name format: <servername>-<DD-MM-YYYY-HHMMSS>-<backup|clone>
 #  - retention cleanup (uses per-snapshot retention-days label when present)
 #
@@ -13,6 +15,7 @@ IFS=$'\n\t'
 # Defaults
 RETENTION_DAYS=30
 LABELS=""
+TAGS=""
 PROJECT=""
 SERVERS_FILE=""
 DRY_RUN=false
@@ -23,23 +26,26 @@ CREATED_BY="auto-snapshot"
 
 usage(){
   cat <<EOF
-Usage: $0 --servers-file <file> [--project <project>] [--labels key=val,...] [--retention-days N]
+Usage: $0 --servers-file <file> [--project <project>] [--labels key=val,...] [--tags key=val,...] [--retention-days N]
           [--activity "reason"] [--backup-type incremental|full|clone] [--storage-location REGION] [--dry-run]
 
- servers-file line formats (per-line override allowed as 4th field):
+ servers-file line formats (per-line override allowed as final field):
    project,zone,instance[,retentionDays]
-   zone,instance[,retentionDays]          (project taken from --project or gcloud config)
-   instance[,retentionDays]               (zone auto-resolved if unique)
+   zone,instance[,retentionDays]
+   instance[,retentionDays]
 
  Examples:
    snap-proj,asia-south1-b,web-01,7
    asia-south1-b,db-01
    web-03,14
+   asia-south1-b,my-disk,7        # treated as disk if instance not found
+   my-disk,7                      # direct disk by name (zone auto-resolved if unique)
 
 Notes:
  - Snapshot names created: <servername>-<DD-MM-YYYY-HHMMSS>-<backup|clone> (sanitized)
  - GCP snapshots are incremental by default. --backup-type full will be labeled 'full' but GCP still stores snapshots incrementally.
  - Use --storage-location to specify snapshot storage location (if supported in your org).
+ - GCP snapshots do not support "tags" like instances; --tags are applied as labels internally.
 EOF
   exit 1
 }
@@ -50,6 +56,7 @@ while [[ $# -gt 0 ]]; do
     --servers-file) SERVERS_FILE="$2"; shift 2;;
     --project) PROJECT="$2"; shift 2;;
     --labels) LABELS="$2"; shift 2;;
+    --tags) TAGS="$2"; shift 2;;
     --retention-days) RETENTION_DAYS="$2"; shift 2;;
     --dry-run) DRY_RUN=true; shift 1;;
     --activity) ACTIVITY="$2"; shift 2;;
@@ -83,6 +90,7 @@ fi
 echo "Project: $PROJECT"
 echo "Servers file: $SERVERS_FILE"
 echo "Labels: $LABELS"
+echo "Tags: $TAGS"
 echo "Global retention days: $RETENTION_DAYS"
 echo "Activity: $ACTIVITY"
 echo "Backup type: $BACKUP_TYPE"
@@ -102,11 +110,23 @@ run_cmd(){
   fi
 }
 
+# describe instance (returns JSON or empty on error)
+describe_instance(){
+  local inst="$1"; local proj="$2"; local zone="$3"
+  gcloud compute instances describe "$inst" --project "$proj" --zone "$zone" --format=json 2>/dev/null
+}
+
 # label arg builder (includes our bookkeeping labels)
 # accepts optional extra labels string added later (e.g., per-snapshot retention)
 build_label_arg(){
   local extra_labels="$1"  # optional, may be empty
   local labels="$LABELS"
+
+  # user "tags" (conceptual) are implemented as labels on snapshots
+  if [[ -n "$TAGS" ]]; then
+    labels="${labels}${labels:+,}${TAGS}"
+  fi
+
   labels="${labels}${labels:+,}created-by=${CREATED_BY}"
   if [[ -n "$ACTIVITY" ]]; then
     act=$(echo "$ACTIVITY" | sed 's/[^a-zA-Z0-9]/_/g' | tr '[:upper:]' '[:lower:]')
@@ -124,16 +144,11 @@ build_label_arg(){
   echo "--labels=${labels}"
 }
 
-# describe instance (returns JSON or prints gcloud error to stderr)
-describe_instance(){
-  local inst="$1"; local proj="$2"; local zone="$3"
-  gcloud compute instances describe "$inst" --project "$proj" --zone "$zone" --format=json 2>&1
-}
-
 # sanitize snapshot name to GCP rules
 sanitize_snapshot_name(){
   local raw="$1"
-  local s=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g' | sed -E 's/^-+//;s/-+$//')
+  local s
+  s=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9-]/-/g' | sed -E 's/^-+//;s/-+$//')
   if [[ ! "$s" =~ ^[a-z] ]]; then
     s="s-${s}"
   fi
@@ -149,65 +164,157 @@ sanitize_snapshot_name(){
 
 # main loop
 while IFS= read -r line || [[ -n "$line" ]]; do
+  # trim full line
   line=$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
   [[ -z "$line" || "${line:0:1}" == "#" ]] && continue
 
-  IFS=',' read -ra parts <<< "$line"
-  perline_retention=""
-  if [[ ${#parts[@]} -ge 3 ]]; then
-    # project,zone,instance[,retention]
-    if [[ ${#parts[@]} -ge 4 ]]; then
-      perline_retention=$(echo "${parts[3]}" | tr -d ' ')
-    fi
-    project="${parts[0]}"
-    zone="${parts[1]}"
-    inst="${parts[2]}"
-  elif [[ ${#parts[@]} -eq 2 ]]; then
-    # zone,instance[,retention]
-    project="$PROJECT"
-    zone="${parts[0]}"
-    inst="${parts[1]}"
-  else
-    # instance[,retention]
-    project="$PROJECT"
-    inst="${parts[0]}"
-    # find zone if unique
-    zones_found=$(gcloud compute instances list --project "$project" --filter="name=($inst)" --format="value(zone.basename())" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
-    if [[ -z "$zones_found" ]]; then
-      log "ERROR: Could not find instance '$inst' in project '$project'. Skipping."
-      continue
-    fi
-    IFS=',' read -ra zarr <<< "$zones_found"
-    if [[ ${#zarr[@]} -ne 1 ]]; then
-      log "ERROR: Instance name '$inst' is not unique across zones: $zones_found. Provide zone explicitly. Skipping."
-      continue
-    fi
-    zone=${zarr[0]}
+  # split on commas and trim each part (handles extra spacing)
+  IFS=',' read -ra raw_parts <<< "$line"
+  parts=()
+  for p in "${raw_parts[@]}"; do
+    local_trimmed=$(echo "$p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -n "$local_trimmed" ]] && parts+=("$local_trimmed")
+  done
+
+  num_parts=${#parts[@]}
+  if [[ $num_parts -eq 0 ]]; then
+    continue
   fi
 
-  # decide retention for this instance
-  if [[ -n "$perline_retention" && "$perline_retention" =~ ^[0-9]+$ ]]; then
+  perline_retention=""
+  project="$PROJECT"
+  zone=""
+  name=""
+
+  case "$num_parts" in
+    4)
+      # project,zone,name,retention
+      project="${parts[0]}"
+      zone="${parts[1]}"
+      name="${parts[2]}"
+      perline_retention="${parts[3]}"
+      ;;
+    3)
+      # could be project,zone,name OR zone,name,retention
+      if [[ "${parts[2]}" =~ ^[0-9]+$ ]]; then
+        # zone, name, retention
+        zone="${parts[0]}"
+        name="${parts[1]}"
+        perline_retention="${parts[2]}"
+      else
+        # project, zone, name
+        project="${parts[0]}"
+        zone="${parts[1]}"
+        name="${parts[2]}"
+      fi
+      ;;
+    2)
+      # could be zone,name OR name,retention
+      if [[ "${parts[1]}" =~ ^[0-9]+$ ]]; then
+        # name, retention
+        name="${parts[0]}"
+        perline_retention="${parts[1]}"
+      else
+        # zone, name
+        zone="${parts[0]}"
+        name="${parts[1]}"
+      fi
+      ;;
+    1)
+      # name only
+      name="${parts[0]}"
+      ;;
+    *)
+      log "ERROR: Invalid line format: $line"
+      continue
+      ;;
+  esac
+
+  # clean and validate retention override
+  if [[ -n "$perline_retention" ]]; then
+    perline_retention=$(echo "$perline_retention" | tr -d ' ')
+    if ! [[ "$perline_retention" =~ ^[0-9]+$ ]]; then
+      log "WARNING: Invalid retention '${perline_retention}' for '${name}', using global ${RETENTION_DAYS}d"
+      perline_retention=""
+    fi
+  fi
+
+  # decide retention for this entry
+  if [[ -n "$perline_retention" ]]; then
     retention_days="$perline_retention"
   else
     retention_days="$RETENTION_DAYS"
   fi
 
-  log "Processing: project=$project zone=$zone instance=$inst retention=${retention_days}d"
+  inst="$name"
+  is_instance="false"
+  is_direct_disk="false"
 
-  inst_json=$(describe_instance "$inst" "$project" "$zone") || {
-    log "ERROR: Failed to describe instance $inst in $zone. gcloud output:"
-    echo "$inst_json"
-    log "Skipping."
-    continue
-  }
-
-  # extract disks
-  disk_names=$(echo "$inst_json" | jq -r '.disks[]?.source' 2>/dev/null | sed -E 's|.*/||' || true)
-  if [[ -z "$disk_names" ]]; then
-    log "WARNING: No disks found for $inst. Skipping."
-    continue
+  # Try to resolve as instance first
+  # If zone not known, attempt to auto-resolve instance zone
+  if [[ -z "$zone" ]]; then
+    zones_found=$(gcloud compute instances list --project "$project" --filter="name=($inst)" --format="value(zone.basename())" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+    if [[ -n "$zones_found" ]]; then
+      IFS=',' read -ra zarr <<< "$zones_found"
+      if [[ ${#zarr[@]} -eq 1 ]]; then
+        zone="${zarr[0]}"
+      else
+        log "INFO: Instance name '$inst' not unique across zones for project '$project' (zones: $zones_found). Will attempt disk matching."
+        zone=""
+      fi
+    fi
   fi
 
+  inst_json=""
+  if [[ -n "$zone" ]]; then
+    inst_json=$(describe_instance "$inst" "$project" "$zone" || true)
+  fi
+
+  if [[ -n "$inst_json" ]]; then
+    is_instance="true"
+  fi
+
+  disk_names=""
+
+  if [[ "$is_instance" == "true" ]]; then
+    log "Processing instance: project=$project zone=$zone instance=$inst retention=${retention_days}d"
+    disk_names=$(echo "$inst_json" | jq -r '.disks[]?.source' 2>/dev/null | sed -E 's|.*/||' || true)
+    if [[ -z "$disk_names" ]]; then
+      log "WARNING: No disks found for instance $inst. Skipping."
+      continue
+    fi
+  else
+    # Treat as disk name
+    disk_name="$name"
+
+    # If zone still unknown, resolve based on disk name
+    if [[ -z "$zone" ]]; then
+      zones_found=$(gcloud compute disks list --project "$project" --filter="name=($disk_name)" --format="value(zone.basename())" 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+      if [[ -z "$zones_found" ]]; then
+        log "ERROR: Could not find instance or disk named '$disk_name' in project '$project'. Skipping."
+        continue
+      fi
+      IFS=',' read -ra zarr <<< "$zones_found"
+      if [[ ${#zarr[@]} -ne 1 ]]; then
+        log "ERROR: Name '$disk_name' is not unique across disk zones: $zones_found. Provide zone explicitly. Skipping."
+        continue
+      fi
+      zone="${zarr[0]}"
+    fi
+
+    # verify disk exists
+    if ! gcloud compute disks describe "$disk_name" --project "$project" --zone "$zone" >/dev/null 2>&1; then
+      log "ERROR: '$disk_name' is neither a valid instance nor disk in project=$project zone=$zone. Skipping."
+      continue
+    fi
+
+    log "Processing disk directly: project=$project zone=$zone disk=$disk_name retention=${retention_days}d"
+    disk_names="$disk_name"
+    is_direct_disk="true"
+    inst="$disk_name"
+  fi
+
+  # snapshot all discovered disks
   for disk in $disk_names; do
     ts=$(date -u +"%d-%m-%Y-%H%M%S")
     type_tag="backup"
@@ -226,7 +333,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
     snap_name=$(sanitize_snapshot_name "$raw_name")
 
     # description and labels (include per-snapshot retention label)
-    desc="Snapshot of disk ${disk} from ${inst} taken at ${ts} (type=${BACKUP_TYPE})"
+    if [[ "$is_direct_disk" == "true" ]]; then
+      desc="Snapshot of disk ${disk} taken at ${ts} (type=${BACKUP_TYPE})"
+    else
+      desc="Snapshot of disk ${disk} from instance ${inst} taken at ${ts} (type=${BACKUP_TYPE})"
+    fi
+
     extra_labels="retention-days=${retention_days}"
     labelArg=$(build_label_arg "${extra_labels}")
 
